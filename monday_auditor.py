@@ -1,29 +1,3 @@
-"""
-Monday.com Data Completeness Auditor
-Production-ready Streamlit app.
-
-Fixes applied vs previous version:
-  1. Checkbox false-positive: any explicit "checked" key (true OR false) is
-     a deliberate user choice — no longer flagged as missing.
-  2. System-managed column types expanded: auto_number, formula, button,
-     subtasks, and mirror are all unreachable by the end user and are
-     excluded from the audit.
-  3. EMPTY_TEXT_VALUES extended with "undefined" and "tbd" (common Monday
-     default / integration-written values).
-  4. Meaningful-key coverage extended: tag_ids, rating, votersIds now
-     prevent false positives on Tags, Rating, and Vote columns.
-  5. GraphQL complexity-budget errors are caught and retried with back-off
-     instead of surfacing as a raw error to the user.
-  6. Timeline "from"/"to" keys added to meaningful_keys so a set timeline
-     is never reported missing.
-  7. Deleted-column guard: columns whose title resolves to an empty string
-     after stripping are skipped at the API layer (already present) and
-     also in _make_record to prevent phantom records.
-  8. board_relation kept in audit (user can link items); mirror removed
-     (reflects another board — user cannot fill it directly; the
-     board_relation that feeds it is already audited separately).
-"""
-
 import json
 import re
 import time
