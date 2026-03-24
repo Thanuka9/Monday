@@ -1,713 +1,1003 @@
-import os
+"""
+Monday.com Data Completeness Auditor
+Production-ready Streamlit app.
+
+Fixes applied vs previous version:
+  1. Checkbox false-positive: any explicit "checked" key (true OR false) is
+     a deliberate user choice — no longer flagged as missing.
+  2. System-managed column types expanded: auto_number, formula, button,
+     subtasks, and mirror are all unreachable by the end user and are
+     excluded from the audit.
+  3. EMPTY_TEXT_VALUES extended with "undefined" and "tbd" (common Monday
+     default / integration-written values).
+  4. Meaningful-key coverage extended: tag_ids, rating, votersIds now
+     prevent false positives on Tags, Rating, and Vote columns.
+  5. GraphQL complexity-budget errors are caught and retried with back-off
+     instead of surfacing as a raw error to the user.
+  6. Timeline "from"/"to" keys added to meaningful_keys so a set timeline
+     is never reported missing.
+  7. Deleted-column guard: columns whose title resolves to an empty string
+     after stripping are skipped at the API layer (already present) and
+     also in _make_record to prevent phantom records.
+  8. board_relation kept in audit (user can link items); mirror removed
+     (reflects another board — user cannot fill it directly; the
+     board_relation that feeds it is already audited separately).
+"""
+
 import json
+import re
+import time
+import logging
+from datetime import datetime
+
 import requests
 import pandas as pd
 import streamlit as st
 
-# ==============================
-# PAGE CONFIG
-# ==============================
-st.set_page_config(
-    page_title="Monday.com Data Auditor",
-    page_icon="📊",
-    layout="wide",
-)
+# =============================================================================
+# Page config  (must be first Streamlit call)
+# =============================================================================
+st.set_page_config(page_title="Monday Auditor", layout="wide", page_icon="📋")
 
-# ==============================
-# CONFIG
-# ==============================
-API_URL = "https://api.monday.com/v2"
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Prefer Streamlit secrets, then environment variable
-API_KEY = None
-try:
-    API_KEY = st.secrets["MONDAY_API_KEY"]
-except Exception:
-    API_KEY = os.getenv("MONDAY_API_KEY")
+# =============================================================================
+# Constants — edit these to tune behaviour
+# =============================================================================
+API_URL          = "https://api.monday.com/v2"
+MAX_RETRIES      = 3
+RETRY_BACKOFF    = 2          # seconds; doubles on each retry
+COMPLEXITY_WAIT  = 12         # seconds to wait after a complexity-budget error
+ITEMS_PAGE_LIMIT = 500        # Monday.com hard max per page
 
-if not API_KEY:
-    st.error("Missing Monday API key. Add MONDAY_API_KEY to Streamlit secrets or environment variables.")
-    st.stop()
+# Column titles that are always skipped (system / structural display columns)
+EXCLUDE_COLUMN_TITLES: frozenset = frozenset({"Subitems", "Item ID", "Name"})
 
-HEADERS = {
-    "Authorization": API_KEY,
-    "API-Version": "2023-10",
-    "Content-Type": "application/json",
-}
-
-# Columns to ignore in missing-data audit
-EXCLUDE_COLUMN_TITLES = {
-    "Subitems",
-    "Item ID",
-    "Name",
-}
-
-# Column types that are usually not useful to audit as missing
-EXCLUDE_COLUMN_TYPES = {
-    "mirror",
-    "board_relation",
+# Column *types* that are always skipped.
+#
+# Rule: skip a type only when the end user CANNOT fill it — it is either
+# auto-managed by Monday or is a pure structural/linking column whose
+# presence is controlled elsewhere.
+#
+#   creation_log  — system: creation timestamp, written by Monday
+#   last_updated  — system: last-edit timestamp, written by Monday
+#   auto_number   — system: sequential ID, auto-incremented by Monday
+#   formula       — system: computed from other column values
+#   button        — system: action trigger, stores no persistent data
+#   subtasks      — structural: the subitem-link column on a parent board
+#   mirror        — derived: reflects a linked board's column value;
+#                   the user must fix the source board_relation column
+#                   (which IS audited) — reporting both creates duplicate noise
+EXCLUDE_COLUMN_TYPES: frozenset = frozenset({
     "creation_log",
     "last_updated",
-    "color_picker",
-    "formula",
     "auto_number",
+    "formula",
+    "button",
+    "subtasks",
+    "mirror",
+})
+
+# Column names containing these words are flagged HIGH severity
+HIGH_PRIORITY_KEYWORDS: frozenset = frozenset({
+    "date", "owner", "status", "email", "deadline", "priority",
+})
+
+# Text values that count as "blank" — lowercased comparison.
+# "undefined" appears when some Monday integrations write before a value
+# is resolved; "tbd" is a common placeholder written by automations.
+EMPTY_TEXT_VALUES: frozenset = frozenset({
+    "", "-", "null", "none", "n/a", "undefined", "tbd",
+})
+
+# Board names matching any of these substrings are hidden from the picker
+BLOCK_KEYWORDS: frozenset = frozenset({
+    "subitem", "untitled", "test", "demo", "sample", "template",
+    "backup", "archive copy", "archived copy", "do not use",
+    "old board", "old version", "copy of", "duplicate",
+    "sandbox", "training board",
+})
+
+# Board names that are blocked by exact match (after normalisation)
+BLOCK_EXACT_NAMES: frozenset = frozenset({"", "subitems", "untitled", "untitled board"})
+
+# Whitelist: leave empty to allow all boards, or add specific board IDs as strings
+ALLOWED_BOARD_IDS: set = set()
+
+# Subitem names that are auto-generated placeholders
+JUNK_SUBITEM_NAMES: frozenset = frozenset({
+    "", "subitem", "new item", "new subitem", "-", "test",
+})
+
+# =============================================================================
+# Session-state defaults  (idempotent — only sets keys that don't exist yet)
+# =============================================================================
+_DEFAULTS: dict = {
+    "audit_df":        pd.DataFrame(),
+    "audit_ran":       False,
+    "board_search":    "",
+    "filter_severity": [],
+    "filter_type":     [],
+    "filter_board":    [],
+    "filter_missing":  [],
+    "filter_col_type": [],
+    "filter_search":   "",
+    "_board_selection": [],
 }
-
-# More important keywords
-HIGH_PRIORITY_KEYWORDS = {
-    "date", "due", "owner", "person", "people", "status",
-    "timeline", "priority", "email", "phone", "deadline"
-}
-
-# ==============================
-# SESSION STATE DEFAULTS
-# ==============================
-DEFAULT_STATE = {
-    "audit_df": pd.DataFrame(),
-    "audit_ran": False,
-    "selected_boards": [],
-    "selected_columns": [],
-    "selected_item_types": ["Main", "Subitem"],
-    "selected_severity": ["HIGH", "MEDIUM"],
-    "search": "",
-    "board_search": "",
-}
-
-for key, value in DEFAULT_STATE.items():
-    if key not in st.session_state:
-        st.session_state[key] = value
-
-# ==============================
-# HELPERS
-# ==============================
-def safe_request(query, variables=None):
-    try:
-        res = requests.post(
-            API_URL,
-            json={"query": query, "variables": variables or {}},
-            headers=HEADERS,
-            timeout=30
-        )
-
-        if res.status_code != 200:
-            st.error(f"API Error {res.status_code}: {res.text}")
-            return None
-
-        data = res.json()
-
-        if "errors" in data:
-            st.error(data["errors"])
-            return None
-
-        return data
-
-    except requests.exceptions.Timeout:
-        st.error("Request timed out.")
-        return None
-    except Exception as e:
-        st.error(f"Request failed: {e}")
-        return None
+for _k, _v in _DEFAULTS.items():
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
 
 
-@st.cache_data(ttl=600)
-def get_account_slug():
-    data = safe_request("{ account { slug } }")
-    if not data:
-        return "workspace"
+# =============================================================================
+# API layer
+# =============================================================================
 
-    try:
-        return data["data"]["account"]["slug"]
-    except Exception:
-        return "workspace"
+def _headers(api_key: str) -> dict:
+    return {"Authorization": api_key, "Content-Type": "application/json"}
 
 
-@st.cache_data(ttl=600)
-def get_all_boards():
-    query = """
-    {
-      boards(limit: 1000) {
-        id
-        name
-      }
-    }
+def _is_complexity_error(data: dict) -> bool:
+    """Return True when Monday has exhausted the GraphQL complexity budget."""
+    for err in data.get("errors", []):
+        msg = str(err.get("message", "") or err)
+        if "COMPLEXITY" in msg.upper() or "complexity" in msg:
+            return True
+    return False
+
+
+def query_monday(
+    query: str,
+    variables: dict = None,
+    api_key: str = "",
+) -> dict | None:
     """
-    data = safe_request(query)
+    POST a GraphQL query to the Monday.com v2 API.
+
+    Retry strategy:
+      • Network timeouts and transient request errors → exponential back-off.
+      • HTTP 429 rate-limit → honour the Retry-After header.
+      • GraphQL COMPLEXITY_BUDGET_EXHAUSTED → wait COMPLEXITY_WAIT seconds
+        then retry (Monday resets the budget every 60 s; a short pause is
+        usually enough for a single-page query).
+
+    Returns the parsed response dict, or None on unrecoverable failure.
+    """
+    key     = api_key or st.session_state.get("api_key", "")
+    payload = {"query": query, "variables": variables or {}}
+    delay   = RETRY_BACKOFF
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            res = requests.post(
+                API_URL, json=payload, headers=_headers(key), timeout=60,
+            )
+
+            # ── Rate-limit ──────────────────────────────────────────────────
+            if res.status_code == 429:
+                wait = int(res.headers.get("Retry-After", delay))
+                logger.warning(
+                    "Rate limited — waiting %ds (attempt %d/%d).",
+                    wait, attempt, MAX_RETRIES,
+                )
+                time.sleep(wait)
+                continue
+
+            res.raise_for_status()
+            data = res.json()
+
+            # ── Complexity budget exhausted ──────────────────────────────────
+            if _is_complexity_error(data):
+                logger.warning(
+                    "Complexity budget exhausted — waiting %ds (attempt %d/%d).",
+                    COMPLEXITY_WAIT, attempt, MAX_RETRIES,
+                )
+                time.sleep(COMPLEXITY_WAIT)
+                continue
+
+            # ── Other GraphQL errors ─────────────────────────────────────────
+            if "errors" in data:
+                st.error(f"GraphQL error: {data['errors']}")
+                return None
+
+            return data
+
+        except requests.exceptions.Timeout:
+            logger.warning("Timeout on attempt %d/%d.", attempt, MAX_RETRIES)
+        except requests.exceptions.RequestException as exc:
+            logger.warning(
+                "Request error on attempt %d/%d: %s", attempt, MAX_RETRIES, exc,
+            )
+
+        if attempt < MAX_RETRIES:
+            time.sleep(delay)
+            delay *= 2
+
+    st.error(f"API unreachable after {MAX_RETRIES} attempts. Check your connection.")
+    return None
+
+
+# =============================================================================
+# Board-level helpers
+# =============================================================================
+
+def _normalize(text: str) -> str:
+    """Lowercase and collapse whitespace."""
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+
+def should_block_board(name: str) -> bool:
+    """Return True if this board name should be hidden from the picker."""
+    lower = _normalize(name)
+    if lower in BLOCK_EXACT_NAMES:
+        return True
+    return any(kw in lower for kw in BLOCK_KEYWORDS)
+
+
+@st.cache_data(show_spinner=False)
+def get_boards(api_key: str) -> dict[str, str]:
+    """
+    Return {display_label: board_id} for all valid active boards.
+
+    api_key is an explicit parameter (not read from session state) so
+    the Streamlit cache is correctly keyed per credential.
+    """
+    data = query_monday(
+        "{ boards(limit: 1000, state: active) { id name board_kind } }",
+        api_key=api_key,
+    )
     if not data:
         return {}
 
+    board_map: dict[str, str] = {}
+    for b in data.get("data", {}).get("boards", []):
+        name       = (b.get("name") or "").strip()
+        board_id   = str(b.get("id", ""))
+        board_kind = b.get("board_kind", "")
+
+        if not name or should_block_board(name):
+            continue
+        # board_kind "sub" = auto-created subitem board — skip
+        if board_kind not in {"public", "private", "share"}:
+            continue
+        if ALLOWED_BOARD_IDS and board_id not in ALLOWED_BOARD_IDS:
+            continue
+
+        label = f"{name} (ID: {board_id})"
+        board_map.setdefault(label, board_id)
+
+    return dict(sorted(board_map.items(), key=lambda x: x[0].lower()))
+
+
+@st.cache_data(show_spinner=False)
+def get_account_info(api_key: str) -> dict:
+    """Return {name, slug} for the Monday account tied to this key."""
+    data = query_monday("{ account { name slug } }", api_key=api_key)
+    if data:
+        return data.get("data", {}).get("account", {}) or {}
+    return {}
+
+
+# =============================================================================
+# Column / value helpers
+# =============================================================================
+
+def _parse_json(value: str | None):
+    """Parse a JSON string; return original value on failure."""
     try:
-        boards = data["data"]["boards"]
-        return {b["name"]: str(b["id"]) for b in boards if b.get("name") and b.get("id")}
+        return json.loads(value) if value else None
     except Exception:
-        return {}
+        return value
 
 
-def parse_json_value(raw_value):
-    if raw_value in (None, "", "null"):
-        return None
-    try:
-        return json.loads(raw_value)
-    except Exception:
-        return raw_value
+def is_missing(col: dict) -> bool:
+    """
+    Return True when a column has no meaningful value filled in.
+
+    Decision tree
+    ─────────────
+    1. Skip system / auto-managed column types entirely — the end user
+       cannot fill these, so reporting them as missing is misleading.
+
+    2. Text check — if the text representation contains real content
+       (i.e. not in EMPTY_TEXT_VALUES) the field is considered filled.
+       This single check handles: text, numbers, email, phone, link,
+       dropdown (text = chosen label), date (text = formatted date),
+       hour, location, rating, and most other column types.
+
+    3. JSON value check — fallback for columns where the text field is
+       legitimately empty even when data exists:
+         • personsAndTeams  — person/team assigned
+         • linkedPulseIds   — legacy connect-boards format
+         • linked_item_ids  — current connect-boards format
+         • files            — file attachment
+         • label            — status / dropdown label object
+         • date             — ISO date string
+         • tag_ids          — tags column (text is usually blank)
+         • rating           — rating value
+         • votersIds        — vote column
+         • from / to        — timeline column start and end dates
+         • checked          — checkbox (TRUE or FALSE is a deliberate
+                              choice; the key's presence is enough)
+         • index            — status / dropdown selection index
+                              (index 0 = first option, a valid selection)
+    """
+    # ── 1. Skip unauditable column types ────────────────────────────────────
+    col_type = col.get("type", "")
+    if col_type in EXCLUDE_COLUMN_TYPES:
+        return False
+
+    # ── 1b. Rating column early exit ────────────────────────────────────────
+    # Monday writes "0" in the text field and {"rating": 0} in value when no
+    # rating is set.  We cannot add "0" to EMPTY_TEXT_VALUES globally because
+    # that would incorrectly flag a numbers column that legitimately holds 0.
+    # Handle the rating type here — before the generic text check — so both
+    # the text and JSON signals are evaluated consistently for this type.
+    if col_type == "rating":
+        _rv = _parse_json(col.get("value"))
+        _n  = _rv.get("rating") if isinstance(_rv, dict) else None
+        return not (isinstance(_n, (int, float)) and _n > 0)
+
+    # ── 2. Text check ────────────────────────────────────────────────────────
+    raw_text   = col.get("text")
+    text_clean = raw_text.strip().lower() if isinstance(raw_text, str) else ""
+    if text_clean not in EMPTY_TEXT_VALUES:
+        return False   # field has visible content — not missing
+
+    # ── 3. JSON value check ──────────────────────────────────────────────────
+    parsed = _parse_json(col.get("value"))
+
+    if isinstance(parsed, dict):
+        # Any truthy value on a recognised key means the field is filled.
+        # Note: "rating" is handled separately below because Monday stores
+        # {"rating": 0} when the column is unset — 0 must not count as filled.
+        meaningful_keys = (
+            "label",           # status / dropdown label object
+            "date",            # date column ISO string
+            "personsAndTeams", # people / teams assigned
+            "linkedPulseIds",  # connect-boards (legacy)
+            "linked_item_ids", # connect-boards (current)
+            "files",           # file attachments
+            "tag_ids",         # tags column
+            "votersIds",       # vote column
+            "from",            # timeline start date
+            "to",              # timeline end date
+        )
+        if any(parsed.get(k) not in (None, "", [], {}) for k in meaningful_keys):
+            return False
+
+        # Rating: Monday uses {"rating": 0} for "not set" and {"rating": N}
+        # (N ≥ 1) for an actual selection. Treat 0 as missing.
+        rating_val = parsed.get("rating")
+        if isinstance(rating_val, (int, float)) and rating_val > 0:
+            return False
+
+        # Checkbox — the key's existence means the user has interacted with
+        # the field (checked = True OR deliberately left unchecked = False).
+        # Both are valid states, not missing data.
+        if "checked" in parsed:
+            return False
+
+        # Status / dropdown index — index 0 is the first valid option, not
+        # "unset". Unset fields have index = null in the Monday API.
+        if parsed.get("index") not in (None, ""):
+            return False
+
+    return True   # no content found by any method → field is missing
 
 
-def is_effectively_empty_value(value):
-    if value is None:
+def is_junk_subitem(sub: dict) -> bool:
+    """
+    Return True for subitems that are auto-created placeholder rows.
+    These have never been touched by a user and clutter the audit output.
+    """
+    name = (sub.get("name") or "").strip().lower()
+
+    # Auto-generated / placeholder name
+    if name in JUNK_SUBITEM_NAMES:
         return True
 
-    if isinstance(value, str):
-        return value.strip() in {"", "-", "None", "null", "{}", "[]"}
+    values = sub.get("column_values", [])
 
-    if isinstance(value, (list, tuple, set, dict)):
-        return len(value) == 0
+    # No column data returned — nothing to audit
+    if not values:
+        return True
+
+    # Every column is blank — ghost row that was never filled
+    if all(
+        str(col.get("text") or "").strip().lower() in EMPTY_TEXT_VALUES
+        for col in values
+    ):
+        return True
 
     return False
 
 
-def is_missing(col):
-    """
-    Better missing detection using both text and underlying JSON value.
-    """
-    col_type = (col.get("type") or "").strip().lower()
-    text = col.get("text")
-    raw_value = col.get("value")
-    parsed_value = parse_json_value(raw_value)
-
-    if col_type in EXCLUDE_COLUMN_TYPES:
-        return False
-
-    if text is None and raw_value is None:
-        return True
-
-    if not is_effectively_empty_value(text):
-        return False
-
-    if not is_effectively_empty_value(parsed_value):
-        if isinstance(parsed_value, dict):
-            common_keys = ["label", "text", "name", "email", "phone", "date", "changed_at"]
-            for key in common_keys:
-                if key in parsed_value and not is_effectively_empty_value(parsed_value.get(key)):
-                    return False
-
-            persons = parsed_value.get("personsAndTeams") or parsed_value.get("persons_and_teams")
-            if persons and len(persons) > 0:
-                return False
-
-            if parsed_value.get("from") or parsed_value.get("to") or parsed_value.get("date"):
-                return False
-
-            files = parsed_value.get("files") or parsed_value.get("assets")
-            if files and len(files) > 0:
-                return False
-
-            linked = parsed_value.get("linkedPulseIds") or parsed_value.get("linked_item_ids")
-            if linked and len(linked) > 0:
-                return False
-
-        elif isinstance(parsed_value, list) and len(parsed_value) > 0:
-            return False
-
-    return True
+def get_severity(col_name: str) -> str:
+    lower = (col_name or "").lower()
+    return "HIGH" if any(k in lower for k in HIGH_PRIORITY_KEYWORDS) else "MEDIUM"
 
 
-def get_severity(column_title, item_type):
-    title = (column_title or "").lower()
+def suggest_fix(col_name: str, col_type: str = "") -> str:
+    """Return a short, actionable instruction for the missing field."""
+    name  = (col_name  or "").lower()
+    ctype = (col_type  or "").lower()
 
-    if any(keyword in title for keyword in HIGH_PRIORITY_KEYWORDS):
-        return "HIGH"
+    if any(w in name for w in ("owner", "person", "assignee", "responsible")):
+        return "Assign responsible user"
+    if any(w in name for w in ("date", "deadline", "due", "start", "end")):
+        return "Set date"
+    if "status" in name:
+        return "Update status"
+    if "email" in name:
+        return "Add email address"
+    if "phone" in name:
+        return "Add phone number"
+    if "priority" in name:
+        return "Set priority"
+    if any(w in name for w in ("budget", "cost", "amount", "price", "revenue")):
+        return "Enter value"
 
-    if item_type == "Main":
-        return "HIGH"
+    # Fall back to column-type hints
+    type_hints = {
+        "numbers":        "Enter numeric value",
+        "numeric":        "Enter numeric value",
+        "link":           "Add URL",
+        "text":           "Enter text",
+        "long_text":      "Enter text",
+        "dropdown":       "Select option",
+        "board_relation": "Link related item",
+        "tags":           "Add tag(s)",
+        "rating":         "Set rating",
+        "vote":           "Cast vote",
+        "timeline":       "Set date range",
+        "week":           "Select week",
+        "location":       "Enter location",
+        "color":          "Choose colour",
+        "doc":            "Attach document",
+        "file":           "Upload file",
+        "hour":           "Set time",
+    }
+    if ctype in type_hints:
+        return type_hints[ctype]
 
-    return "MEDIUM"
+    return "Fill required field"
 
 
-# ==============================
-# DATA FETCH
-# ==============================
-def fetch_board_items_with_subitems(board_id):
-    query = """
-    query ($board_id: [ID!]) {
-      boards(ids: $board_id) {
-        id
-        name
-        items_page(limit: 500) {
-          cursor
-          items {
-            id
-            name
-            column_values {
-              id
-              type
-              text
-              value
-              column { title }
-            }
-            subitems {
-              id
-              name
-              column_values {
-                id
-                type
-                text
-                value
-                column { title }
-              }
-            }
-          }
+# =============================================================================
+# GraphQL queries
+# =============================================================================
+
+_FIRST_PAGE_QUERY = """
+query ($id: [ID!]) {
+  boards(ids: $id) {
+    items_page(limit: """ + str(ITEMS_PAGE_LIMIT) + """) {
+      cursor
+      items {
+        id name
+        column_values { id type text value column { title } }
+        subitems {
+          id name
+          column_values { id type text value column { title } }
         }
       }
     }
+  }
+}
+"""
+
+_NEXT_PAGE_QUERY = """
+query ($cursor: String!) {
+  next_items_page(limit: """ + str(ITEMS_PAGE_LIMIT) + """, cursor: $cursor) {
+    cursor
+    items {
+      id name
+      column_values { id type text value column { title } }
+      subitems {
+        id name
+        column_values { id type text value column { title } }
+      }
+    }
+  }
+}
+"""
+
+
+# =============================================================================
+# Board processing
+# =============================================================================
+
+def _make_record(
+    board_id: str, board_name: str, slug: str,
+    item_type: str, parent_name: str,
+    task_name: str, task_id: str, col: dict,
+) -> dict | None:
     """
+    Build a single audit record dict.
+    Returns None if the column title is empty (e.g. a deleted column that
+    still appears in the API response) — callers must filter None values.
+    """
+    col_meta = col.get("column") or {}
+    col_name = col_meta.get("title", "").strip()
+    if not col_name:
+        return None   # guard against deleted / phantom columns
 
-    res = safe_request(query, {"board_id": [board_id]})
-    if not res:
-        return None
-
-    boards_data = res.get("data", {}).get("boards", [])
-    if not boards_data:
-        return None
-
-    board = boards_data[0]
-    items_page = board.get("items_page") or {}
-    items = items_page.get("items", []) or []
-    cursor = items_page.get("cursor")
-
-    while cursor:
-        next_query = """
-        query ($cursor: String!) {
-          next_items_page(limit: 500, cursor: $cursor) {
-            cursor
-            items {
-              id
-              name
-              column_values {
-                id
-                type
-                text
-                value
-                column { title }
-              }
-              subitems {
-                id
-                name
-                column_values {
-                  id
-                  type
-                  text
-                  value
-                  column { title }
-                }
-              }
-            }
-          }
-        }
-        """
-        next_res = safe_request(next_query, {"cursor": cursor})
-        if not next_res:
-            break
-
-        next_page = next_res.get("data", {}).get("next_items_page", {})
-        next_items = next_page.get("items", []) or []
-        items.extend(next_items)
-        cursor = next_page.get("cursor")
-
-    board["all_items"] = items
-    return board
+    col_type = col.get("type", "")
+    path = (
+        f"{board_name} > {parent_name} > {task_name} > {col_name}"
+        if item_type == "Subitem"
+        else f"{board_name} > {task_name} > {col_name}"
+    )
+    return {
+        "Board":       board_name,
+        "Board ID":    board_id,
+        "Type":        item_type,
+        "Parent":      parent_name,
+        "Task":        task_name,
+        "Item ID":     task_id,
+        "Missing":     col_name,
+        "Column ID":   col.get("id", ""),
+        "Column Type": col_type,
+        "Severity":    get_severity(col_name),
+        "Fix":         suggest_fix(col_name, col_type),
+        "Path":        path,
+        "Link":        f"https://{slug}.monday.com/boards/{board_id}/pulses/{task_id}",
+    }
 
 
-def fetch_and_analyze_boards(board_ids, slug):
-    if not board_ids:
-        return pd.DataFrame()
+def _process_page(
+    items: list,
+    board_id: str,
+    board_name: str,
+    slug: str,
+    results: list,
+) -> None:
+    """Evaluate one page of items and append any missing-field records."""
+    for item in items:
+        item_name = item.get("name") or "Unknown"
+        item_id   = str(item.get("id", ""))
 
-    results = []
-    progress = st.progress(0, text="Starting audit...")
+        # ── Main item columns ──────────────────────────────────────────────
+        for col in item.get("column_values", []):
+            col_title = (col.get("column") or {}).get("title", "").strip()
+            if not col_title or col_title in EXCLUDE_COLUMN_TITLES:
+                continue
+            if col.get("type", "") in EXCLUDE_COLUMN_TYPES:
+                continue
+            if is_missing(col):
+                record = _make_record(
+                    board_id, board_name, slug,
+                    "Main", item_name, item_name, item_id, col,
+                )
+                if record:
+                    results.append(record)
 
-    total = len(board_ids)
-
-    for i, board_id in enumerate(board_ids, start=1):
-        progress.progress(i / total, text=f"Scanning board {i}/{total}")
-
-        board = fetch_board_items_with_subitems(board_id)
-        if not board:
-            continue
-
-        board_name = board.get("name", "Unknown Board")
-        b_id = board.get("id", board_id)
-        items = board.get("all_items", [])
-
-        for item in items:
-            item_name = item.get("name", "Unnamed Item")
-            item_id = item.get("id")
-
-            # Main items
-            for col in item.get("column_values", []):
-                col_name = (col.get("column") or {}).get("title", "Unknown")
-                col_type = (col.get("type") or "").strip().lower()
-
-                if col_name in EXCLUDE_COLUMN_TITLES or col_type in EXCLUDE_COLUMN_TYPES:
+        # ── Subitems ───────────────────────────────────────────────────────
+        for sub in item.get("subitems", []):
+            if is_junk_subitem(sub):
+                continue
+            sub_name = (sub.get("name") or "").strip()
+            sub_id   = str(sub.get("id", ""))
+            for col in sub.get("column_values", []):
+                col_title = (col.get("column") or {}).get("title", "").strip()
+                if not col_title or col_title in EXCLUDE_COLUMN_TITLES:
                     continue
-
+                if col.get("type", "") in EXCLUDE_COLUMN_TYPES:
+                    continue
                 if is_missing(col):
-                    results.append({
-                        "Board": board_name,
-                        "Item Type": "Main",
-                        "Parent Item": item_name,
-                        "Task": item_name,
-                        "Missing Column": col_name,
-                        "Column Type": col_type,
-                        "Severity": get_severity(col_name, "Main"),
-                        "Open": f"https://{slug}.monday.com/boards/{b_id}/pulses/{item_id}" if item_id else ""
-                    })
-
-            # Subitems
-            for sub in item.get("subitems", []):
-                sub_name = sub.get("name", "Unnamed Subitem")
-                sub_id = sub.get("id")
-
-                for col in sub.get("column_values", []):
-                    col_name = (col.get("column") or {}).get("title", "Unknown")
-                    col_type = (col.get("type") or "").strip().lower()
-
-                    if col_name in EXCLUDE_COLUMN_TITLES or col_type in EXCLUDE_COLUMN_TYPES:
-                        continue
-
-                    if is_missing(col):
-                        results.append({
-                            "Board": board_name,
-                            "Item Type": "Subitem",
-                            "Parent Item": item_name,
-                            "Task": sub_name,
-                            "Missing Column": col_name,
-                            "Column Type": col_type,
-                            "Severity": get_severity(col_name, "Subitem"),
-                            "Open": f"https://{slug}.monday.com/boards/{b_id}/pulses/{sub_id}" if sub_id else ""
-                        })
-
-    progress.empty()
-
-    if not results:
-        return pd.DataFrame(columns=[
-            "Board", "Item Type", "Parent Item", "Task",
-            "Missing Column", "Column Type", "Severity", "Open"
-        ])
-
-    return pd.DataFrame(results)
+                    record = _make_record(
+                        board_id, board_name, slug,
+                        "Subitem", item_name, sub_name, sub_id, col,
+                    )
+                    if record:
+                        results.append(record)
 
 
-# ==============================
-# UI HEADER
-# ==============================
-st.title("📊 Monday Data Auditor")
-st.caption("Audit Monday boards for missing data in both main items and subitems.")
+def process_board(board_id: str, board_name: str, slug: str) -> list:
+    """
+    Fetch every item on a board (handling pagination) and return
+    a list of missing-field records.
 
-slug = get_account_slug()
-boards = get_all_boards()
+    Pagination strategy
+    ───────────────────
+    Page 1  → boards > items_page          (initialises the cursor)
+    Page 2+ → root next_items_page(cursor) (lower API complexity cost)
+    """
+    results: list = []
 
-if not boards:
-    st.error("Failed to load boards.")
+    # ── Page 1 ────────────────────────────────────────────────────────────
+    data = query_monday(_FIRST_PAGE_QUERY, {"id": [board_id]})
+    if not data:
+        return results
+
+    try:
+        page   = data["data"]["boards"][0]["items_page"]
+        items  = page.get("items", [])
+        cursor = page.get("cursor")
+    except (KeyError, IndexError, TypeError) as exc:
+        logger.warning(
+            "Unexpected page-1 response for board %s: %s", board_id, exc,
+        )
+        return results
+
+    _process_page(items, board_id, board_name, slug, results)
+
+    # ── Pages 2+ ─────────────────────────────────────────────────────────
+    while cursor:
+        data = query_monday(_NEXT_PAGE_QUERY, {"cursor": cursor})
+        if not data:
+            break
+        try:
+            page   = data["data"]["next_items_page"]
+            items  = page.get("items", [])
+            cursor = page.get("cursor")
+        except (KeyError, TypeError) as exc:
+            logger.warning(
+                "Unexpected next-page response for board %s: %s", board_id, exc,
+            )
+            break
+        _process_page(items, board_id, board_name, slug, results)
+
+    return results
+
+
+# =============================================================================
+# UI helpers
+# =============================================================================
+
+def safe_multiselect(label: str, options: list, session_key: str) -> list:
+    """
+    Multiselect whose default value is automatically sanitised against
+    the current option list — prevents Streamlit's crash when persisted
+    session-state values no longer exist in the available options.
+    """
+    clean_opts   = sorted(str(x) for x in options if pd.notna(x))
+    current      = st.session_state.get(session_key, [])
+    safe_default = [x for x in current if x in clean_opts]
+    selection    = st.multiselect(
+        label, options=clean_opts, default=safe_default,
+    )
+    st.session_state[session_key] = selection
+    return selection
+
+
+def safe_contains(df: pd.DataFrame, search_text: str) -> pd.Series:
+    """
+    Case-insensitive substring search across human-readable columns only.
+    Avoids searching ID / link columns for performance and accuracy.
+    """
+    search_cols = [
+        "Board", "Type", "Parent", "Task", "Missing",
+        "Column Type", "Severity", "Fix", "Path",
+    ]
+    cols = [c for c in search_cols if c in df.columns]
+    return (
+        df[cols]
+        .astype(str)
+        .apply(lambda x: x.str.contains(
+            search_text, case=False, na=False, regex=False,
+        ))
+        .any(axis=1)
+    )
+
+
+# =============================================================================
+# App layout
+# =============================================================================
+
+st.title("📋 Monday Auditor")
+
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.header("Configuration")
+    st.text_input(
+        "API Key", type="password", key="api_key",
+        help="Monday.com → Profile picture → Developers → API token",
+    )
+    api_key = st.session_state.get("api_key", "")
+
+    if api_key:
+        _acct = get_account_info(api_key)
+        if _acct:
+            st.success(f"✔ Connected: **{_acct.get('name', 'Unknown')}**")
+        else:
+            st.error("Could not verify API key.")
+
+    st.divider()
+
+    if st.button("🔄 Refresh Board List", use_container_width=True):
+        get_boards.clear()
+        get_account_info.clear()
+        st.rerun()
+
+    if not st.session_state.audit_df.empty:
+        st.divider()
+        _adf = st.session_state.audit_df
+        st.markdown("**Last audit**")
+        st.markdown(f"- Total issues: **{len(_adf)}**")
+        st.markdown(f"- Boards audited: **{_adf['Board'].nunique()}**")
+        st.markdown(f"- HIGH severity: **{(_adf['Severity'] == 'HIGH').sum()}**")
+
+# ── Guard — no key ────────────────────────────────────────────────────────────
+if not api_key:
+    st.info("👈 Enter your Monday.com API key in the sidebar to get started.")
     st.stop()
 
-all_board_names = sorted(boards.keys())
+# ── Account / slug (fetched once, reused everywhere) ─────────────────────────
+account = get_account_info(api_key)
+slug    = account.get("slug", "")
+if not slug:
+    st.error(
+        "Could not retrieve your Monday.com account slug. "
+        "Check your API key and try refreshing."
+    )
+    st.stop()
 
-# Optional search box for board picker
-if st.session_state.board_search:
-    visible_board_names = [
-        b for b in all_board_names
-        if st.session_state.board_search.lower() in b.lower()
-    ]
-else:
-    visible_board_names = all_board_names
+# ── Board selection ───────────────────────────────────────────────────────────
+boards = get_boards(api_key)
+if not boards:
+    st.warning(
+        "No valid boards found. Check your API key or adjust "
+        "`BLOCK_KEYWORDS` / `ALLOWED_BOARD_IDS` in the config section."
+    )
+    st.stop()
 
+st.markdown("### 1 · Select Boards to Audit")
 
-# ==============================
-# CALLBACKS (MUST BE ABOVE SIDEBAR)
-# ==============================
-def select_visible_boards():
-    st.session_state.selected_boards = st.session_state.visible_board_names.copy()
-
-def clear_selected_boards():
-    st.session_state.selected_boards = []
-
-def refresh_boards():
-    get_all_boards.clear()
-    get_account_slug.clear()
-    st.session_state.selected_boards = []
-    st.session_state.audit_df = pd.DataFrame()
-    st.session_state.audit_ran = False
-
-def reset_filters():
-    st.session_state.selected_columns = []
-    st.session_state.selected_item_types = ["Main", "Subitem"]
-    st.session_state.selected_severity = ["HIGH", "MEDIUM"]
-    st.session_state.search = ""
-
-
-# ==============================
-# SIDEBAR
-# ==============================
-with st.sidebar:
-    st.header("Controls")
-
-    # 🔍 SEARCH
+search_col, count_col = st.columns([3, 1])
+with search_col:
     st.text_input(
-        "Search boards",
-        key="board_search",
-        placeholder="Type to filter board names..."
+        "Filter board list", key="board_search", placeholder="Type to narrow…",
+    )
+with count_col:
+    st.metric("Boards available", len(boards))
+
+visible_boards = list(boards.keys())
+if st.session_state.board_search:
+    q = st.session_state.board_search.lower().strip()
+    visible_boards = [b for b in visible_boards if q in b.lower()]
+
+sa_col, sd_col, _ = st.columns([1, 1, 6])
+with sa_col:
+    if st.button("✅ Select all", use_container_width=True):
+        st.session_state["_board_selection"] = visible_boards
+        st.rerun()
+with sd_col:
+    if st.button("✖ Clear", use_container_width=True):
+        st.session_state["_board_selection"] = []
+        st.rerun()
+
+# Sanitise persisted selection against currently visible boards
+st.session_state["_board_selection"] = [
+    b for b in st.session_state["_board_selection"] if b in visible_boards
+]
+
+selected = st.multiselect(
+    "Boards",
+    options=visible_boards,
+    default=st.session_state["_board_selection"],
+    label_visibility="collapsed",
+)
+st.session_state["_board_selection"] = selected
+
+# ── Run Audit ─────────────────────────────────────────────────────────────────
+st.markdown("### 2 · Run Audit")
+run_col, caption_col = st.columns([1, 4])
+with run_col:
+    run_audit = st.button(
+        "▶ Run Audit", type="primary",
+        use_container_width=True, disabled=not selected,
+    )
+with caption_col:
+    st.caption(
+        f"{len(selected)} board(s) selected · "
+        "Audits all user-fillable columns on main items and subitems · Paginated"
     )
 
-    # 🔁 FILTER BOARD LIST (STORE IN STATE → IMPORTANT)
-    if st.session_state.board_search:
-        st.session_state.visible_board_names = [
-            b for b in all_board_names
-            if st.session_state.board_search.lower() in b.lower()
-        ]
-    else:
-        st.session_state.visible_board_names = all_board_names.copy()
+if run_audit:
+    all_results: list = []
+    errors:      list = []
+    total        = len(selected)
+    progress_bar = st.progress(0.0, text="Starting…")
+    status_box   = st.empty()
 
-    # 🧠 SAFETY: ensure selected boards always valid
-    st.session_state.selected_boards = [
-        b for b in st.session_state.selected_boards
-        if b in all_board_names
+    for i, board_label in enumerate(selected, start=1):
+        board_id = boards.get(board_label)
+        if not board_id:
+            errors.append(f"Could not resolve ID for: {board_label}")
+            progress_bar.progress(i / total, text=f"{i}/{total} — skipped")
+            continue
+
+        # Strip the "(ID: ...)" suffix for clean display
+        display_name = re.sub(r"\s*\(ID:\s*\d+\)\s*$", "", board_label).strip()
+        status_box.info(f"Processing {i}/{total}: {display_name}")
+
+        try:
+            board_results = process_board(board_id, display_name, slug)
+            all_results.extend(board_results)
+        except Exception as exc:
+            errors.append(f"{display_name}: {exc}")
+            logger.exception("Unhandled error processing board %s", board_id)
+
+        progress_bar.progress(i / total, text=f"{i}/{total} complete")
+
+    progress_bar.empty()
+    status_box.empty()
+
+    if errors:
+        with st.expander(
+            f"⚠ {len(errors)} board(s) had errors — expand for details",
+        ):
+            for e in errors:
+                st.warning(e)
+
+    st.session_state.audit_df  = pd.DataFrame(all_results)
+    st.session_state.audit_ran = True
+    st.success(
+        f"Audit complete — **{len(all_results)}** issue(s) "
+        f"across **{len(selected)}** board(s)."
+    )
+
+# ── Results ───────────────────────────────────────────────────────────────────
+df = st.session_state.audit_df
+
+if st.session_state.audit_ran and df.empty:
+    st.success("🎉 No missing fields found across the audited boards.")
+    st.stop()
+
+if df.empty:
+    st.info("No results yet. Select boards above and click **▶ Run Audit**.")
+    st.stop()
+
+# Sort: HIGH before MEDIUM, then alphabetically by board / task
+severity_order = pd.CategoricalDtype(["HIGH", "MEDIUM"], ordered=True)
+df["Severity"] = df["Severity"].astype(severity_order)
+df             = df.sort_values(["Severity", "Board", "Type", "Task"])
+
+st.markdown("---")
+st.markdown("### 3 · Results")
+
+# ── Pre-sanitise filter state before any widget renders ───────────────────────
+# Prevents crashes when a quick-filter button sets a value (e.g. "Subitem")
+# that no longer exists in the current dataset after a new audit.
+_valid: dict = {
+    "filter_severity": set(df["Severity"].dropna().astype(str).unique()),
+    "filter_type":     set(df["Type"].dropna().astype(str).unique()),
+    "filter_board":    set(df["Board"].dropna().astype(str).unique()),
+    "filter_missing":  set(df["Missing"].dropna().astype(str).unique()),
+    "filter_col_type": set(df["Column Type"].dropna().astype(str).unique()),
+}
+for _fk, _vs in _valid.items():
+    st.session_state[_fk] = [
+        v for v in st.session_state.get(_fk, []) if v in _vs
     ]
 
-    # ==============================
-    # BUTTONS (SAFE WITH CALLBACKS)
-    # ==============================
-    c1, c2 = st.columns(2)
-
+# ── Filter widgets ────────────────────────────────────────────────────────────
+with st.expander("🔽 Filters", expanded=True):
+    c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
-        st.button(
-            "Select visible",
-            on_click=select_visible_boards,
-            width="stretch"
+        severity_f = safe_multiselect(
+            "Severity",
+            df["Severity"].dropna().unique().tolist(),
+            "filter_severity",
         )
-
     with c2:
-        st.button(
-            "Clear boards",
-            on_click=clear_selected_boards,
-            width="stretch"
+        type_f = safe_multiselect(
+            "Type",
+            df["Type"].dropna().unique().tolist(),
+            "filter_type",
+        )
+    with c3:
+        board_f = safe_multiselect(
+            "Board",
+            df["Board"].dropna().unique().tolist(),
+            "filter_board",
+        )
+    with c4:
+        missing_f = safe_multiselect(
+            "Missing Column",
+            df["Missing"].dropna().unique().tolist(),
+            "filter_missing",
+        )
+    with c5:
+        coltype_f = safe_multiselect(
+            "Column Type",
+            df["Column Type"].dropna().unique().tolist(),
+            "filter_col_type",
         )
 
-    # ==============================
-    # BOARD SELECTOR (SAFE)
-    # ==============================
-    st.multiselect(
-        "Boards",
-        options=st.session_state.visible_board_names,
-        key="selected_boards",
-        placeholder="Select one or more boards"
+    st.text_input(
+        "🔍 Search across results", key="filter_search",
+        placeholder="Search board, task, path, fix suggestion…",
     )
 
-    st.markdown("---")
+    b1, b2, b3, b4 = st.columns(4)
+    with b1:
+        if st.button("⚡ HIGH only"):
+            st.session_state.filter_severity = ["HIGH"]
+            st.rerun()
+    with b2:
+        if st.button("📄 Main only"):
+            st.session_state.filter_type = ["Main"]
+            st.rerun()
+    with b3:
+        if st.button("🔗 Subitems only"):
+            if "Subitem" in df["Type"].values:
+                st.session_state.filter_type = ["Subitem"]
+            else:
+                st.warning("No subitems in this dataset.")
+            st.rerun()
+    with b4:
+        if st.button("↺ Reset filters"):
+            for _fk in (
+                "filter_severity", "filter_type", "filter_board",
+                "filter_missing", "filter_col_type",
+            ):
+                st.session_state[_fk] = []
+            st.session_state.filter_search = ""
+            st.rerun()
 
-    # ==============================
-    # RUN AUDIT
-    # ==============================
-    if st.button("🚀 Run Audit", width="stretch"):
-        if not st.session_state.selected_boards:
-            st.warning("Select at least one board.")
-        else:
-            ids = [
-                boards[name]
-                for name in st.session_state.selected_boards
-                if name in boards
-            ]
+# ── Apply filters ─────────────────────────────────────────────────────────────
+filtered = df.copy()
+if severity_f:
+    filtered = filtered[filtered["Severity"].isin(severity_f)]
+if type_f:
+    filtered = filtered[filtered["Type"].isin(type_f)]
+if board_f:
+    filtered = filtered[filtered["Board"].isin(board_f)]
+if missing_f:
+    filtered = filtered[filtered["Missing"].isin(missing_f)]
+if coltype_f:
+    filtered = filtered[filtered["Column Type"].isin(coltype_f)]
+if st.session_state.filter_search:
+    filtered = filtered[safe_contains(filtered, st.session_state.filter_search)]
 
-            with st.spinner("Fetching and analyzing boards..."):
-                st.session_state.audit_df = fetch_and_analyze_boards(ids, slug)
-                st.session_state.audit_ran = True
+# ── Summary metrics ───────────────────────────────────────────────────────────
+st.markdown("#### Summary")
+m1, m2, m3, m4, m5 = st.columns(5)
+m1.metric("Filtered Issues",  len(filtered))
+m2.metric("HIGH Priority",    (filtered["Severity"] == "HIGH").sum())
+m3.metric("MEDIUM Priority",  (filtered["Severity"] == "MEDIUM").sum())
+m4.metric("Main Item Issues", (filtered["Type"] == "Main").sum())
+m5.metric("Subitem Issues",   (filtered["Type"] == "Subitem").sum())
 
-    # ==============================
-    # REFRESH
-    # ==============================
-    st.button(
-        "🔄 Refresh Boards",
-        on_click=refresh_boards,
-        width="stretch"
-    )
+# ── Top problem boards ────────────────────────────────────────────────────────
+worst = (
+    filtered.groupby("Board").size()
+    .reset_index(name="Issues")
+    .sort_values("Issues", ascending=False)
+    .head(10)
+)
+st.markdown("#### Top Problem Boards")
+st.dataframe(worst, width="stretch", hide_index=True)
 
-    # ==============================
-    # RESET FILTERS
-    # ==============================
-    st.button(
-        "🧹 Reset Filters",
-        on_click=reset_filters,
-        width="stretch"
-    )
-# ==============================
-# RESULTS
-# ==============================
-if st.session_state.audit_ran:
-    df = st.session_state.audit_df.copy()
+# ── Detailed issues table ─────────────────────────────────────────────────────
+st.markdown("#### Detailed Issues")
 
-    if df.empty:
-        st.success("No missing data found 🎉")
-    else:
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Missing Cells", len(df))
-        c2.metric("Boards Affected", df["Board"].nunique())
-        c3.metric("Main Items Affected", df[df["Item Type"] == "Main"]["Task"].nunique())
-        c4.metric("Subitems Affected", df[df["Item Type"] == "Subitem"]["Task"].nunique())
+DISPLAY_COLS = [
+    "Board", "Type", "Parent", "Task", "Missing",
+    "Column Type", "Severity", "Fix", "Path", "Link",
+]
+display_df = filtered[DISPLAY_COLS].copy()
+display_df["Severity"] = display_df["Severity"].astype(str)  # categorical → plain str
 
-        st.markdown("## 🎯 Filters")
+st.dataframe(
+    display_df,
+    width="stretch",
+    hide_index=True,
+    column_config={
+        "Link": st.column_config.LinkColumn(
+            "Open in Monday", display_text="Open ↗",
+        ),
+    },
+)
 
-        f1, f2, f3, f4 = st.columns(4)
-
-        with f1:
-            selected_cols = st.multiselect(
-                "Missing Column",
-                sorted(df["Missing Column"].dropna().unique().tolist()),
-                key="selected_columns"
-            )
-
-        with f2:
-            item_type_filter = st.multiselect(
-                "Item Type",
-                ["Main", "Subitem"],
-                key="selected_item_types"
-            )
-
-        with f3:
-            severity_filter = st.multiselect(
-                "Severity",
-                ["HIGH", "MEDIUM"],
-                key="selected_severity"
-            )
-
-        with f4:
-            search = st.text_input(
-                "Search results",
-                key="search",
-                placeholder="Search board, task, parent item, or column..."
-            )
-
-        display_df = df.copy()
-
-        if selected_cols:
-            display_df = display_df[display_df["Missing Column"].isin(selected_cols)]
-
-        if item_type_filter:
-            display_df = display_df[display_df["Item Type"].isin(item_type_filter)]
-
-        if severity_filter:
-            display_df = display_df[display_df["Severity"].isin(severity_filter)]
-
-        if search:
-            display_df = display_df[
-                display_df["Board"].astype(str).str.contains(search, case=False, na=False) |
-                display_df["Task"].astype(str).str.contains(search, case=False, na=False) |
-                display_df["Parent Item"].astype(str).str.contains(search, case=False, na=False) |
-                display_df["Missing Column"].astype(str).str.contains(search, case=False, na=False)
-            ]
-
-        st.markdown("## 📈 Summary")
-
-        if display_df.empty:
-            st.info("No matching results for the current filters.")
-        else:
-            s1, s2 = st.columns(2)
-
-            with s1:
-                st.markdown("### Missing by Column")
-                col_summary = (
-                    display_df.groupby("Missing Column")
-                    .size()
-                    .reset_index(name="Missing Count")
-                    .sort_values("Missing Count", ascending=False)
-                )
-                st.dataframe(col_summary, use_container_width=True, hide_index=True)
-                if not col_summary.empty:
-                    st.bar_chart(col_summary.set_index("Missing Column")["Missing Count"])
-
-            with s2:
-                st.markdown("### Missing by Board")
-                board_summary = (
-                    display_df.groupby("Board")
-                    .size()
-                    .reset_index(name="Missing Count")
-                    .sort_values("Missing Count", ascending=False)
-                )
-                st.dataframe(board_summary, use_container_width=True, hide_index=True)
-                if not board_summary.empty:
-                    st.bar_chart(board_summary.set_index("Board")["Missing Count"])
-
-            s3, s4 = st.columns(2)
-
-            with s3:
-                st.markdown("### Missing by Severity")
-                sev_summary = (
-                    display_df.groupby("Severity")
-                    .size()
-                    .reset_index(name="Missing Count")
-                    .sort_values("Missing Count", ascending=False)
-                )
-                st.dataframe(sev_summary, use_container_width=True, hide_index=True)
-
-            with s4:
-                st.markdown("### Missing by Item Type")
-                type_summary = (
-                    display_df.groupby("Item Type")
-                    .size()
-                    .reset_index(name="Missing Count")
-                    .sort_values("Missing Count", ascending=False)
-                )
-                st.dataframe(type_summary, use_container_width=True, hide_index=True)
-
-            st.markdown("## 📋 Detailed Results")
-
-            display_df = display_df.sort_values(
-                by=["Severity", "Board", "Item Type", "Missing Column", "Task"],
-                ascending=[True, True, True, True, True]
-            ).copy()
-
-            display_df["Where Missing"] = display_df.apply(
-                lambda row: (
-                    f"Subitem: {row['Task']} | Parent: {row['Parent Item']} | Missing: {row['Missing Column']}"
-                    if row["Item Type"] == "Subitem"
-                    else f"Item: {row['Task']} | Missing: {row['Missing Column']}"
-                ),
-                axis=1
-            )
-
-            result_columns = [
-                "Board",
-                "Item Type",
-                "Parent Item",
-                "Task",
-                "Missing Column",
-                "Column Type",
-                "Severity",
-                "Where Missing",
-                "Open",
-            ]
-
-            st.dataframe(
-                display_df[result_columns],
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Open": st.column_config.LinkColumn("Open Item", display_text="Open ↗"),
-                    "Where Missing": "Issue Details",
-                }
-            )
-
-            st.download_button(
-                "📥 Download CSV",
-                display_df[result_columns].to_csv(index=False).encode("utf-8"),
-                file_name="monday_audit_results.csv",
-                mime="text/csv"
-            )
-
-            st.markdown("### Grouped View")
-            grouped = (
-                display_df.groupby(["Board", "Item Type", "Missing Column"])
-                .size()
-                .reset_index(name="Count")
-                .sort_values(["Board", "Count"], ascending=[True, False])
-            )
-            st.dataframe(grouped, use_container_width=True, hide_index=True)
-
-else:
-    st.info("Select one or more boards from the sidebar and run the audit.")
+# ── Export ────────────────────────────────────────────────────────────────────
+ts = datetime.now().strftime("%Y%m%d_%H%M")
+st.download_button(
+    label="⬇ Download CSV",
+    data=display_df.to_csv(index=False),
+    file_name=f"monday_audit_{ts}.csv",
+    mime="text/csv",
+)
